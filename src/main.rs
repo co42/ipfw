@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::copy_bidirectional;
@@ -10,18 +11,28 @@ use tokio::time::sleep;
 #[derive(Debug, Parser)]
 #[clap(name = "ipfw")]
 struct Args {
-    source_addr: String,
+    /// Listen on this address
+    listen_addr: String,
+    /// Redirect traffic to this address
     target_addr: String,
+    /// Only receive packets from IPv6 addresses
+    #[clap(long)]
+    v6_only: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let source_addr = args.source_addr.parse::<SocketAddr>()?;
-    let target_addr = args.target_addr.parse::<SocketAddr>()?;
+    let Args {
+        listen_addr,
+        target_addr,
+        v6_only,
+    } = Args::parse();
+    let listen_addr = listen_addr.parse::<SocketAddr>()?;
+    let target_addr = target_addr.parse::<SocketAddr>()?;
 
     let check_addr_handle = tokio::spawn(async move { check_addr(target_addr).await });
-    let accept_handle = tokio::spawn(async move { accept(source_addr, target_addr).await });
+    let accept_handle =
+        tokio::spawn(async move { accept(listen_addr, target_addr, v6_only).await });
 
     select! {
         result = check_addr_handle => {
@@ -50,9 +61,21 @@ async fn check_addr(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
-async fn accept(source_addr: SocketAddr, target_addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(source_addr).await?;
-    println!("Listening on {source_addr}");
+async fn accept(
+    listen_addr: SocketAddr,
+    target_addr: SocketAddr,
+    v6_only: bool,
+) -> anyhow::Result<()> {
+    let listener = if v6_only {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_only_v6(true)?;
+        socket.bind(&listen_addr.into())?;
+        socket.set_nonblocking(true)?;
+        socket.listen(1024)?;
+        TcpListener::from_std(socket.into())?
+    } else {
+        TcpListener::bind(listen_addr).await?
+    };
 
     loop {
         let mut peer_stream = match listener.accept().await {
